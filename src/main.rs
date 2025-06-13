@@ -13,17 +13,77 @@ use tray_icon::{TrayIconBuilder, menu::{Menu, MenuEvent, MenuItem}, Icon};
 use image::{DynamicImage, ImageBuffer, Rgba};
 use std::sync::mpsc;
 use log::{info, warn};
+use serde::{Deserialize, Serialize};
+use std::fs;
+use std::path::Path;
+use std::collections::HashMap;
+use std::sync::Mutex;
+use once_cell::sync::Lazy;
 
 const WM_KEYDOWN: u32 = 0x0100;
 const WM_KEYUP: u32 = 0x0101;
 const WM_SYSKEYDOWN: u32 = 0x0104;
 const WM_SYSKEYUP: u32 = 0x0105;
 
-static LEFT_CTRL_PRESSED: AtomicBool = AtomicBool::new(false);
-static RIGHT_CTRL_PRESSED: AtomicBool = AtomicBool::new(false);
-static OTHER_KEY_PRESSED: AtomicBool = AtomicBool::new(false);
 static SHOULD_SEND_IME_OFF: AtomicBool = AtomicBool::new(false);
 static SHOULD_SEND_IME_ON: AtomicBool = AtomicBool::new(false);
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Config {
+    log_level: String,
+    keys: KeyConfig,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct KeyConfig {
+    ime_off: u32,
+    ime_on: u32,
+}
+
+impl Default for KeyConfig {
+    fn default() -> Self {
+        KeyConfig {
+            ime_off: VK_LCONTROL.0 as u32,
+            ime_on: VK_RCONTROL.0 as u32,
+        }
+    }
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Config {
+            log_level: "warn".to_string(),
+            keys: KeyConfig::default(),
+        }
+    }
+}
+
+fn load_config() -> Config {
+    let config_path = "config.json";
+    if Path::new(config_path).exists() {
+        match fs::read_to_string(config_path) {
+            Ok(contents) => {
+                match serde_json::from_str(&contents) {
+                    Ok(config) => config,
+                    Err(e) => {
+                        warn!("設定ファイルの解析に失敗しました: {}", e);
+                        Config::default()
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("設定ファイルの読み込みに失敗しました: {}", e);
+                Config::default()
+            }
+        }
+    } else {
+        let config = Config::default();
+        if let Err(e) = fs::write(config_path, serde_json::to_string_pretty(&config).unwrap()) {
+            warn!("設定ファイルの作成に失敗しました: {}", e);
+        }
+        config
+    }
+}
 
 fn get_key_name(vk_code: u32) -> &'static str {
     match vk_code {
@@ -102,6 +162,64 @@ fn is_key_pressed(vk_code: VIRTUAL_KEY) -> bool {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum KeyAction {
+    ImeOff,
+    ImeOn,
+}
+
+struct KeyState {
+    pressed: bool,
+    action: Option<KeyAction>,
+}
+
+struct KeyManager {
+    states: HashMap<u32, KeyState>,
+    other_key_pressed: bool,
+}
+
+impl KeyManager {
+    fn new() -> Self {
+        let config = load_config();
+        let mut states = HashMap::new();
+        states.insert(config.keys.ime_off, KeyState {
+            pressed: false,
+            action: Some(KeyAction::ImeOff),
+        });
+        states.insert(config.keys.ime_on, KeyState {
+            pressed: false,
+            action: Some(KeyAction::ImeOn),
+        });
+        
+        KeyManager {
+            states,
+            other_key_pressed: false,
+        }
+    }
+
+    fn key_down(&mut self, key_code: u32) {
+        if let Some(state) = self.states.get_mut(&key_code) {
+            state.pressed = true;
+        } else if self.states.iter().any(|(_, state)| state.pressed) {
+            // 設定されたキー以外が押された場合
+            self.other_key_pressed = true;
+        }
+    }
+
+    fn key_up(&mut self, key_code: u32) -> Option<KeyAction> {
+        if let Some(state) = self.states.get_mut(&key_code) {
+            state.pressed = false;
+            if !self.other_key_pressed {
+                return state.action;
+            }
+            self.other_key_pressed = false;
+        }
+        None
+    }
+}
+
+static KEY_MANAGER: Lazy<Mutex<KeyManager>> = Lazy::new(|| Mutex::new(KeyManager::new()));
+
 unsafe extern "system" fn hook_callback(code: i32, w_param: WPARAM, l_param: LPARAM) -> LRESULT {
     if code >= 0 {
         let vk_code = l_param.0 as *const KBDLLHOOKSTRUCT;
@@ -110,28 +228,15 @@ unsafe extern "system" fn hook_callback(code: i32, w_param: WPARAM, l_param: LPA
             match w_param.0 as u32 {
                 WM_KEYDOWN | WM_SYSKEYDOWN => {
                     info!("キー押下: {} ({})", get_key_name(key_code), key_code);
-                    if key_code == VK_LCONTROL.0 as u32 {
-                        LEFT_CTRL_PRESSED.store(true, Ordering::SeqCst);
-                    } else if key_code == VK_RCONTROL.0 as u32 {
-                        RIGHT_CTRL_PRESSED.store(true, Ordering::SeqCst);
-                    } else if LEFT_CTRL_PRESSED.load(Ordering::SeqCst) || RIGHT_CTRL_PRESSED.load(Ordering::SeqCst) {
-                        OTHER_KEY_PRESSED.store(true, Ordering::SeqCst);
-                    }
+                    KEY_MANAGER.lock().unwrap().key_down(key_code);
                 }
                 WM_KEYUP | WM_SYSKEYUP => {
                     info!("キー解放: {} ({})", get_key_name(key_code), key_code);
-                    if key_code == VK_LCONTROL.0 as u32 {
-                        if !OTHER_KEY_PRESSED.load(Ordering::SeqCst) {
-                            SHOULD_SEND_IME_OFF.store(true, Ordering::SeqCst);
+                    if let Some(action) = KEY_MANAGER.lock().unwrap().key_up(key_code) {
+                        match action {
+                            KeyAction::ImeOff => SHOULD_SEND_IME_OFF.store(true, Ordering::SeqCst),
+                            KeyAction::ImeOn => SHOULD_SEND_IME_ON.store(true, Ordering::SeqCst),
                         }
-                        LEFT_CTRL_PRESSED.store(false, Ordering::SeqCst);
-                        OTHER_KEY_PRESSED.store(false, Ordering::SeqCst);
-                    } else if key_code == VK_RCONTROL.0 as u32 {
-                        if !OTHER_KEY_PRESSED.load(Ordering::SeqCst) {
-                            SHOULD_SEND_IME_ON.store(true, Ordering::SeqCst);
-                        }
-                        RIGHT_CTRL_PRESSED.store(false, Ordering::SeqCst);
-                        OTHER_KEY_PRESSED.store(false, Ordering::SeqCst);
                     }
                 }
                 _ => {}
@@ -171,11 +276,23 @@ fn create_icon() -> Icon {
 }
 
 fn main() -> windows::core::Result<()> {
-    // ログ設定
-    simple_logging::log_to_file("kana_power.log", log::LevelFilter::Info).unwrap();
+    // 設定の読み込み
+    let config = load_config();
+    let log_level = match config.log_level.to_lowercase().as_str() {
+        "error" => log::LevelFilter::Error,
+        "warn" => log::LevelFilter::Warn,
+        "info" => log::LevelFilter::Info,
+        "debug" => log::LevelFilter::Debug,
+        "trace" => log::LevelFilter::Trace,
+        _ => log::LevelFilter::Warn,
+    };
     
-    info!("キー入力の監視を開始します。トレイアイコンを右クリックして終了できます。");
-    info!("左Ctrlのみを押して離すとVK_IME_OFFを送信します。");
+    // ログ設定
+    simple_logging::log_to_file("kana_power.log", log_level).unwrap();
+    
+    info!("キー入力の監視を開始します。");
+    info!("IME OFFキー: {}", get_key_name(config.keys.ime_off));
+    info!("IME ONキー: {}", get_key_name(config.keys.ime_on));
     
     // トレイアイコンの設定
     let (tx, rx) = mpsc::channel();
